@@ -19,6 +19,7 @@
     BIN_ID: "6aaac11affd5d160530ecd5e",          // ID bin на jsonbin.io
     ACCESS_KEY: "$2a$10$4jLGHSq6t9XFTXvyaO9mwePMiuZcL5ySXe9uyOuUjuFMdy2gip9fO",  // Access Key (не Master Key!) с правами Bins: Read + Update
     POLL_MS: 30000,                  // как часто подтягивать изменения второго игрока
+    TOP_PAD: 68,                     // отступ сверху, px (18 базовых + 50 под шапку Telegram)
   };
 </script>
 <script type="text/babel" data-presets="react">
@@ -73,6 +74,221 @@ const TITLES = [
 ];
 const titleFor = (n) => (TITLES.find(([m]) => n >= m) || [0, "Наблюдатель"])[1];
 
+/* ---------- helpers ---------- */
+
+function weekStart(d = new Date()) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+}
+const fmt = (d) => d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+const dayKey = (ts) => new Date(ts).toDateString();
+const has = (e, w) => (e.title || "").toLowerCase().includes(w);
+
+function relTime(ts) {
+  const m = Math.round((Date.now() - ts) / 60000);
+  if (m < 1) return "только что";
+  if (m < 60) return `${m} мин назад`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} ч назад`;
+  return new Date(ts).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+}
+
+const sum = (list, pid) =>
+  list.filter((e) => e.playerId === pid).reduce((s, e) => s + e.points, 0);
+
+function weekBuckets(log) {
+  const b = {};
+  log.forEach((e) => {
+    const w = weekStart(new Date(e.ts)).getTime();
+    (b[w] = b[w] || []).push(e);
+  });
+  return b;
+}
+
+function trophies(log, players) {
+  const cur = weekStart().getTime();
+  const out = {};
+  players.forEach((p) => (out[p.id] = 0));
+  Object.entries(weekBuckets(log)).forEach(([w, list]) => {
+    if (Number(w) >= cur) return;
+    const scores = players.map((p) => [p.id, sum(list, p.id)]);
+    const best = Math.max(...scores.map((s) => s[1]));
+    const win = scores.filter((s) => s[1] === best);
+    if (best > 0 && win.length === 1) out[win[0][0]] += 1;
+  });
+  return out;
+}
+
+function streak(log, pid) {
+  const days = new Set(log.filter((e) => e.playerId === pid).map((e) => dayKey(e.ts)));
+  if (!days.size) return 0;
+  const d = new Date();
+  d.setHours(12, 0, 0, 0);
+  if (!days.has(d.toDateString())) d.setDate(d.getDate() - 1);
+  let n = 0;
+  while (days.has(d.toDateString())) {
+    n += 1;
+    d.setDate(d.getDate() - 1);
+  }
+  return n;
+}
+
+/* ---------- achievements ---------- */
+
+const ACHS = [
+  {
+    id: "night",
+    icon: "🌙",
+    name: "Полуночник",
+    desc: "Дело после 23:00. Совесть не спит",
+    test: (mine) => mine.some((e) => new Date(e.ts).getHours() >= 23),
+  },
+  {
+    id: "lark",
+    icon: "🐓",
+    name: "Жаворонок",
+    desc: "Дело до 8 утра. Кто вообще так живёт",
+    test: (mine) => mine.some((e) => new Date(e.ts).getHours() < 8),
+  },
+  {
+    id: "five",
+    icon: "🔥",
+    name: "Пятидневка",
+    desc: "Пять дней подряд без пропусков",
+    test: (mine, ctx) => streak(ctx.log, ctx.pid) >= 5 || ctx.maxStreak >= 5,
+  },
+  {
+    id: "chef",
+    icon: "🍳",
+    name: "Шеф",
+    desc: "Десять ужинов. Ресторан закрыт, вы дома",
+    test: (mine) => mine.filter((e) => has(e, "ужин")).length >= 10,
+  },
+  {
+    id: "bath",
+    icon: "🚿",
+    name: "Санитар",
+    desc: "Пять раз отмыл ванную. Уважение",
+    test: (mine) => mine.filter((e) => has(e, "ванн")).length >= 5,
+  },
+  {
+    id: "trash",
+    icon: "🗑",
+    name: "Мусорный барон",
+    desc: "Двадцать вынесенных пакетов",
+    test: (mine) => mine.filter((e) => has(e, "мусор")).length >= 20,
+  },
+  {
+    id: "sprint",
+    icon: "💨",
+    name: "Спринтер",
+    desc: "Три дела за час. Что-то случилось?",
+    test: (mine) => {
+      const t = mine.map((e) => e.ts).sort((a, b) => a - b);
+      return t.some((_, i) => i >= 2 && t[i] - t[i - 2] <= 36e5);
+    },
+  },
+  {
+    id: "ten",
+    icon: "🎯",
+    name: "Десятка",
+    desc: "Десять дел за одну неделю",
+    test: (mine) => Object.values(weekBuckets(mine)).some((w) => w.length >= 10),
+  },
+  {
+    id: "lucky",
+    icon: "🍀",
+    name: "Везунчик",
+    desc: "Три выигранные дуэли",
+    test: (mine, ctx) =>
+      ctx.log.filter((e) => e.duel && e.playerId !== ctx.pid).length >= 3,
+  },
+  {
+    id: "duelist",
+    icon: "⚔️",
+    name: "Принял судьбу",
+    desc: "Три проигранные дуэли и ни слова жалобы",
+    test: (mine) => mine.filter((e) => e.duel).length >= 3,
+  },
+  {
+    id: "tandem",
+    icon: "🤝",
+    name: "Тандем",
+    desc: "Семь дней, когда работали оба",
+    test: (mine, ctx) => {
+      const [x, y] = ctx.players.map(
+        (p) => new Set(ctx.log.filter((e) => e.playerId === p.id).map((e) => dayKey(e.ts)))
+      );
+      return [...x].filter((d) => y.has(d)).length >= 7;
+    },
+  },
+  {
+    id: "king",
+    icon: "👑",
+    name: "Гегемон",
+    desc: "Три выигранные недели",
+    test: (mine, ctx) => ctx.cups >= 3,
+  },
+  {
+    id: "comeback",
+    icon: "📈",
+    name: "Камбэк",
+    desc: "Выиграл неделю после проигранной",
+    test: (mine, ctx) => {
+      const cur = weekStart().getTime();
+      const buckets = weekBuckets(ctx.log);
+      const ws = Object.keys(buckets)
+        .map(Number)
+        .filter((w) => w < cur)
+        .sort((a, b) => a - b);
+      const other = ctx.players.find((p) => p.id !== ctx.pid);
+      if (!other) return false;
+      const res = ws.map((w) => {
+        const list = buckets[w];
+        const me = sum(list, ctx.pid);
+        const them = sum(list, other.id);
+        return me > them ? 1 : me < them ? -1 : 0;
+      });
+      return res.some((r, i) => i > 0 && r === 1 && res[i - 1] === -1);
+    },
+  },
+  {
+    id: "phoenix",
+    icon: "🦅",
+    name: "Восстал из пепла",
+    desc: "Вернулся после пяти дней тишины",
+    test: (mine) => {
+      const t = mine.map((e) => e.ts).sort((a, b) => a - b);
+      return t.some((v, i) => i > 0 && v - t[i - 1] >= 5 * 864e5);
+    },
+  },
+];
+
+function earned(log, pid, players, cups) {
+  const mine = log.filter((e) => e.playerId === pid);
+  const ctx = { log, pid, players, cups, maxStreak: 0 };
+  const days = [...new Set(mine.map((e) => dayKey(e.ts)))]
+    .map((d) => new Date(d).setHours(12, 0, 0, 0))
+    .sort((a, b) => a - b);
+  let run = days.length ? 1 : 0;
+  let best = run;
+  days.forEach((d, i) => {
+    if (i === 0) return;
+    run = d - days[i - 1] <= 1.5 * 864e5 ? run + 1 : 1;
+    best = Math.max(best, run);
+  });
+  ctx.maxStreak = best;
+  return ACHS.filter((a) => {
+    try {
+      return a.test(mine, ctx);
+    } catch {
+      return false;
+    }
+  }).map((a) => a.id);
+}
+
 /* ---------- storage (JSONBin + localStorage cache) ---------- */
 
 const BIN_URL = `https://api.jsonbin.io/v3/b/${CONFIG.BIN_ID}`;
@@ -113,15 +329,11 @@ async function saveMerged(local) {
   let merged = local;
   if (remote) {
     const seen = new Set();
-    const dropped = new Set([
-      ...(remote.removed || []),
-      ...(local.removed || []),
-    ]);
+    const dropped = new Set([...(remote.removed || []), ...(local.removed || [])]);
     const log = [...(remote.log || []), ...(local.log || [])]
       .filter((e) => (seen.has(e.id) ? false : seen.add(e.id)))
       .filter((e) => !dropped.has(e.id));
-    const newer =
-      (remote.settingsAt || 0) > (local.settingsAt || 0) ? remote : local;
+    const newer = (remote.settingsAt || 0) > (local.settingsAt || 0) ? remote : local;
     merged = { ...newer, log, removed: [...dropped].slice(-300) };
   }
   writeCache(merged);
@@ -135,68 +347,6 @@ async function saveMerged(local) {
     /* оставляем локальную версию до следующего сохранения */
   }
   return merged;
-}
-
-/* ---------- dates & stats ---------- */
-
-function weekStart(d = new Date()) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
-  return x;
-}
-const fmt = (d) =>
-  d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
-const dayKey = (ts) => new Date(ts).toDateString();
-
-function relTime(ts) {
-  const m = Math.round((Date.now() - ts) / 60000);
-  if (m < 1) return "только что";
-  if (m < 60) return `${m} мин назад`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h} ч назад`;
-  return new Date(ts).toLocaleDateString("ru-RU", {
-    day: "numeric",
-    month: "short",
-  });
-}
-
-const sum = (list, pid) =>
-  list.filter((e) => e.playerId === pid).reduce((s, e) => s + e.points, 0);
-
-function trophies(log, players) {
-  const cur = weekStart().getTime();
-  const weeks = {};
-  log.forEach((e) => {
-    const w = weekStart(new Date(e.ts)).getTime();
-    if (w >= cur) return;
-    (weeks[w] = weeks[w] || []).push(e);
-  });
-  const out = {};
-  players.forEach((p) => (out[p.id] = 0));
-  Object.values(weeks).forEach((list) => {
-    const scores = players.map((p) => [p.id, sum(list, p.id)]);
-    const best = Math.max(...scores.map((s) => s[1]));
-    const winners = scores.filter((s) => s[1] === best);
-    if (best > 0 && winners.length === 1) out[winners[0][0]] += 1;
-  });
-  return out;
-}
-
-function streak(log, pid) {
-  const days = new Set(
-    log.filter((e) => e.playerId === pid).map((e) => dayKey(e.ts))
-  );
-  if (!days.size) return 0;
-  const d = new Date();
-  d.setHours(12, 0, 0, 0);
-  if (!days.has(d.toDateString())) d.setDate(d.getDate() - 1);
-  let n = 0;
-  while (days.has(d.toDateString())) {
-    n += 1;
-    d.setDate(d.getDate() - 1);
-  }
-  return n;
 }
 
 /* ---------- app ---------- */
@@ -250,51 +400,54 @@ function App() {
 
   const prevStart = new Date(ws);
   prevStart.setDate(prevStart.getDate() - 7);
-  const prevLog = log.filter(
-    (e) => e.ts >= prevStart.getTime() && e.ts < ws.getTime()
+  const prevLog = log.filter((e) => e.ts >= prevStart.getTime() && e.ts < ws.getTime());
+
+  const addEntry = useCallback(
+    (chore, playerId, extra = {}) => {
+      const s = stateRef.current;
+      const entry = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        choreId: chore.id || "custom",
+        icon: chore.icon || "✳️",
+        title: chore.title,
+        points: chore.points,
+        playerId,
+        ts: Date.now(),
+        ...extra,
+      };
+      const nextLog = [...s.log, entry];
+      const next = { ...s, log: nextLog };
+      sync(next);
+      setOpen(null);
+
+      const p = s.players.find((x) => x.id === playerId);
+      const cupsNow = trophies(nextLog, s.players)[playerId];
+      const before = earned(s.log, playerId, s.players, cupsNow);
+      const after = earned(nextLog, playerId, s.players, cupsNow);
+      const fresh = after.find((id) => !before.includes(id));
+      const wsNow = weekStart().getTime();
+      const wk = sum(s.log.filter((e) => e.ts >= wsNow), playerId);
+      const jumped = titleFor(wk + chore.points) !== titleFor(wk);
+      const st = streak(nextLog, playerId);
+
+      setPop({ playerId, points: chore.points, k: entry.id });
+      if (fresh) {
+        const a = ACHS.find((x) => x.id === fresh);
+        setToast(`${a.icon} ${p.name} получает: ${a.name}`);
+      } else if (jumped) {
+        setToast(`${p.name} теперь ${titleFor(wk + chore.points).toLowerCase()}`);
+      } else if (st >= 3) {
+        setToast(`${st}-й день подряд, ${p.name}`);
+      } else setToast("");
+      setTimeout(() => setPop((x) => (x && x.k === entry.id ? null : x)), 1100);
+      setTimeout(() => setToast(""), 3200);
+    },
+    [sync]
   );
-
-  function addEntry(chore, playerId) {
-    const entry = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      choreId: chore.id || "custom",
-      icon: chore.icon || "✳️",
-      title: chore.title,
-      points: chore.points,
-      playerId,
-      ts: Date.now(),
-    };
-    const next = { ...stateRef.current, log: [...stateRef.current.log, entry] };
-    sync(next);
-    setOpen(null);
-
-    const p = stateRef.current.players.find((x) => x.id === playerId);
-    const st = streak(next.log, playerId);
-    const before = sum(
-      weekLog.filter((e) => e.playerId === playerId),
-      playerId
-    );
-    const after = before + chore.points;
-    const jumped = titleFor(after) !== titleFor(before);
-    setPop({ playerId, points: chore.points, k: entry.id });
-    setToast(
-      jumped
-        ? `${p.name} теперь ${titleFor(after).toLowerCase()}`
-        : st >= 3
-        ? `${st}-й день подряд, ${p.name}`
-        : ""
-    );
-    setTimeout(() => setPop((x) => (x && x.k === entry.id ? null : x)), 1100);
-    setTimeout(() => setToast(""), 2600);
-  }
 
   function removeEntry(id) {
     const s = stateRef.current;
-    sync({
-      ...s,
-      log: s.log.filter((e) => e.id !== id),
-      removed: [...(s.removed || []), id],
-    });
+    sync({ ...s, log: s.log.filter((e) => e.id !== id), removed: [...(s.removed || []), id] });
   }
 
   if (!ready)
@@ -309,7 +462,7 @@ function App() {
       <style>{`
         * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
         button:focus-visible { outline: 2px solid ${C.text}; outline-offset: 2px; }
-        input:focus { outline: none; border-color: ${C.dim}; }
+        input:focus, textarea:focus { outline: none; border-color: ${C.dim}; }
         @keyframes rise { 0%{opacity:0;transform:translateY(8px) scale(.85)} 25%{opacity:1;transform:translateY(-4px) scale(1.05)} 100%{opacity:0;transform:translateY(-30px) scale(1)} }
         @keyframes slide { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:none} }
         .pop { animation: rise 1.1s ease-out forwards; }
@@ -330,29 +483,19 @@ function App() {
       </section>
 
       <div style={S.barWrap}>
-        <div
-          style={{
-            ...S.bar,
-            width: total ? `${(sa / total) * 100}%` : "50%",
-            background: A.color,
-          }}
-        />
+        <div style={{ ...S.bar, width: total ? `${(sa / total) * 100}%` : "50%", background: A.color }} />
         <div style={{ ...S.bar, flex: 1, background: total ? B.color : C.line }} />
       </div>
 
       {toast ? (
-        <p className="toast" style={S.toast}>
-          {toast}
-        </p>
+        <p className="toast" style={S.toast}>{toast}</p>
       ) : (
         <p style={S.prize}>
           {total === 0
             ? "Счёт 0:0. Кто-то же должен начать."
             : sa === sb
             ? "Ничья. Подозрительно ровно."
-            : `Ведёт ${sa > sb ? A.name : B.name} — ${titleFor(
-                Math.max(sa, sb)
-              ).toLowerCase()}, разрыв ${Math.abs(sa - sb)}.`}
+            : `Ведёт ${sa > sb ? A.name : B.name} — ${titleFor(Math.max(sa, sb)).toLowerCase()}, разрыв ${Math.abs(sa - sb)}.`}
           {state.prize ? ` Приз: ${state.prize.toLowerCase()}.` : ""}
         </p>
       )}
@@ -360,8 +503,10 @@ function App() {
       <nav style={S.tabs}>
         {[
           ["chores", "Дела"],
+          ["duel", "Дуэль"],
           ["feed", "Лента"],
-          ["set", "Настройки"],
+          ["ach", "Награды"],
+          ["set", "⚙"],
         ].map(([k, label]) => (
           <button
             key={k}
@@ -412,6 +557,8 @@ function App() {
           </>
         )}
 
+        {tab === "duel" && <Duel state={state} addEntry={addEntry} />}
+
         {tab === "feed" && (
           <div>
             {prevLog.length > 0 && (
@@ -421,8 +568,7 @@ function App() {
             )}
             {weekLog.length === 0 ? (
               <p style={S.empty}>
-                На этой неделе пусто. Посуда сама себя не помоет — откройте
-                «Дела».
+                На этой неделе пусто. Посуда сама себя не помоет — откройте «Дела».
               </p>
             ) : (
               <ul style={S.list}>
@@ -434,23 +580,15 @@ function App() {
                       <li key={e.id} style={S.feedRow}>
                         <span style={S.icon}>{e.icon || "✳️"}</span>
                         <span style={{ flex: 1 }}>
-                          {e.title}
+                          {e.title} {e.duel && "⚔️"}
                           <span style={S.feedMeta}>
-                            <span
-                              style={{
-                                ...S.dot,
-                                background: p ? p.color : C.dim,
-                              }}
-                            />
+                            <span style={{ ...S.dot, background: p ? p.color : C.dim }} />
                             {p ? p.name : "?"}, {relTime(e.ts)}
+                            {e.duel && " · проиграл дуэль"}
                           </span>
                         </span>
                         <span style={S.pts}>+{e.points}</span>
-                        <button
-                          onClick={() => removeEntry(e.id)}
-                          style={S.undo}
-                          aria-label="Убрать запись"
-                        >
+                        <button onClick={() => removeEntry(e.id)} style={S.undo} aria-label="Убрать запись">
                           ✕
                         </button>
                       </li>
@@ -459,6 +597,31 @@ function App() {
               </ul>
             )}
           </div>
+        )}
+
+        {tab === "ach" && (
+          <ul style={S.list}>
+            {ACHS.map((a) => {
+              const owners = state.players.filter((p) =>
+                earned(log, p.id, state.players, cups[p.id]).includes(a.id)
+              );
+              const got = owners.length > 0;
+              return (
+                <li key={a.id} style={{ ...S.achRow, opacity: got ? 1 : 0.45 }}>
+                  <span style={{ ...S.icon, filter: got ? "none" : "grayscale(1)" }}>{a.icon}</span>
+                  <span style={{ flex: 1 }}>
+                    {a.name}
+                    <span style={S.feedMeta}>{a.desc}</span>
+                  </span>
+                  <span style={{ display: "flex", gap: 4 }}>
+                    {owners.map((p) => (
+                      <span key={p.id} style={{ ...S.dot, background: p.color, marginRight: 0 }} />
+                    ))}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
         )}
 
         {tab === "set" && <Settings state={state} sync={sync} />}
@@ -471,9 +634,7 @@ function Side({ p, score, cups, st, pop, align }) {
   return (
     <div style={{ textAlign: align, position: "relative", flex: 1 }}>
       {pop && pop.playerId === p.id && (
-        <span className="pop" style={{ ...S.popup, color: p.color }}>
-          +{pop.points}
-        </span>
+        <span className="pop" style={{ ...S.popup, color: p.color }}>+{pop.points}</span>
       )}
       <div style={{ ...S.score, color: p.color }}>{score}</div>
       <div style={S.name}>{p.name}</div>
@@ -486,6 +647,156 @@ function Side({ p, score, cups, st, pop, align }) {
   );
 }
 
+/* ---------- duel ---------- */
+
+const LINES = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+
+function Duel({ state, addEntry }) {
+  const [chore, setChore] = useState(null);
+  const [mode, setMode] = useState(null);
+  const [cells, setCells] = useState(Array(9).fill(null));
+  const [turn, setTurn] = useState(0);
+  const [loser, setLoser] = useState(null);
+  const [spin, setSpin] = useState(null);
+  const timer = useRef(null);
+
+  useEffect(() => () => clearInterval(timer.current), []);
+
+  function reset() {
+    clearInterval(timer.current);
+    setCells(Array(9).fill(null));
+    setTurn(0);
+    setLoser(null);
+    setSpin(null);
+  }
+
+  function play(i) {
+    if (cells[i] !== null || loser) return;
+    const next = [...cells];
+    next[i] = turn;
+    setCells(next);
+    const line = LINES.find((l) => l.every((k) => next[k] === turn));
+    if (line) setLoser(state.players[1 - turn].id);
+    else if (next.every((c) => c !== null)) setLoser("draw");
+    else setTurn(1 - turn);
+  }
+
+  function drawLot() {
+    let n = 0;
+    setSpin(0);
+    clearInterval(timer.current);
+    timer.current = setInterval(() => {
+      n += 1;
+      setSpin(n % 2);
+      if (n > 13) {
+        clearInterval(timer.current);
+        const pick = Math.random() < 0.5 ? 0 : 1;
+        setSpin(pick);
+        setLoser(state.players[pick].id);
+      }
+    }, 110);
+  }
+
+  if (!chore)
+    return (
+      <div>
+        <p style={S.hint}>
+          Выберите дело, которое никто не хочет делать. Проигравший получает его
+          с двойными очками — так проиграть не обидно.
+        </p>
+        <ul style={S.list}>
+          {state.chores.map((c) => (
+            <li key={c.id} style={S.row}>
+              <button onClick={() => { setChore(c); reset(); }} style={S.choreBtn}>
+                <span style={S.icon}>{c.icon || "✳️"}</span>
+                <span style={{ flex: 1 }}>{c.title}</span>
+                <span style={S.pts}>{c.points * 2}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+
+  const loserP = state.players.find((p) => p.id === loser);
+
+  return (
+    <div>
+      <button onClick={() => { setChore(null); setMode(null); reset(); }} style={S.back}>
+        ← {chore.icon} {chore.title} · {chore.points * 2} очков
+      </button>
+
+      {!mode && (
+        <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
+          <button onClick={() => setMode("ttt")} style={S.add}>Крестики-нолики</button>
+          <button onClick={() => { setMode("lot"); drawLot(); }} style={S.add}>Жребий</button>
+          <p style={S.hint}>
+            Крестики-нолики — игра навыка: если один играет заметно лучше,
+            берите жребий, иначе дело всегда будет доставаться одному и тому же.
+          </p>
+        </div>
+      )}
+
+      {mode === "ttt" && (
+        <div style={{ marginTop: 14 }}>
+          <p style={S.turnLine}>
+            {loser
+              ? loser === "draw"
+                ? "Ничья. Ещё раз."
+                : `Проиграл ${loserP.name}`
+              : `Ходит ${state.players[turn].name}`}
+          </p>
+          <div style={S.grid}>
+            {cells.map((c, i) => (
+              <button
+                key={i}
+                onClick={() => play(i)}
+                style={{ ...S.cell, color: c === null ? C.line : state.players[c].color }}
+                aria-label={`Клетка ${i + 1}`}
+              >
+                {c === null ? "" : c === 0 ? "✕" : "○"}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {mode === "lot" && (
+        <div style={{ marginTop: 14, textAlign: "center" }}>
+          <div
+            style={{
+              ...S.score,
+              fontSize: 34,
+              color: spin === null ? C.dim : state.players[spin].color,
+              padding: "26px 0",
+            }}
+          >
+            {spin === null ? "…" : state.players[spin].name}
+          </div>
+        </div>
+      )}
+
+      {loser && loser !== "draw" && (
+        <div style={{ display: "grid", gap: 8, marginTop: 14 }}>
+          <button
+            onClick={() => { addEntry({ ...chore, points: chore.points * 2 }, loser, { duel: true }); setChore(null); setMode(null); reset(); }}
+            style={{ ...S.whoBtn, background: loserP.color, padding: "15px 0" }}
+          >
+            Записать на {loserP.name} · +{chore.points * 2}
+          </button>
+          <button onClick={reset} style={S.cancelWide}>Переиграть</button>
+        </div>
+      )}
+
+      {loser === "draw" && (
+        <button onClick={reset} style={{ ...S.cancelWide, marginTop: 14 }}>Ещё раз</button>
+      )}
+    </div>
+  );
+}
+
+/* ---------- quick add ---------- */
+
 function QuickAdd({ state, sync, addEntry }) {
   const [on, setOn] = useState(false);
   const [title, setTitle] = useState("");
@@ -497,169 +808,100 @@ function QuickAdd({ state, sync, addEntry }) {
     const t = title.trim();
     if (!t) return;
     const chore = { id: `x${Date.now()}`, icon, title: t, points: Number(points) || 1 };
-    if (keep)
-      sync({
-        ...state,
-        chores: [...state.chores, chore],
-        settingsAt: Date.now(),
-      });
+    if (keep) sync({ ...state, chores: [...state.chores, chore], settingsAt: Date.now() });
     addEntry(chore, playerId);
-    setTitle("");
-    setIcon("✳️");
-    setPoints(2);
-    setKeep(false);
-    setOn(false);
+    setTitle(""); setIcon("✳️"); setPoints(2); setKeep(false); setOn(false);
   }
 
   if (!on)
-    return (
-      <button onClick={() => setOn(true)} style={S.quick}>
-        + Разовое дело
-      </button>
-    );
+    return <button onClick={() => setOn(true)} style={S.quick}>+ Разовое дело</button>;
 
   return (
     <div style={S.quickBox}>
       <div style={{ display: "flex", gap: 8 }}>
-        <input
-          value={icon}
-          onChange={(e) => setIcon(e.target.value.slice(0, 2))}
-          style={{ ...S.input, width: 52, textAlign: "center", marginBottom: 0 }}
-          aria-label="Иконка"
-        />
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Что сделали"
-          autoFocus
-          style={{ ...S.input, flex: 1, marginBottom: 0 }}
-        />
-        <input
-          type="number"
-          min="1"
-          max="9"
-          value={points}
-          onChange={(e) => setPoints(e.target.value)}
-          style={{ ...S.input, width: 56, marginBottom: 0 }}
-          aria-label="Очки"
-        />
+        <input value={icon} onChange={(e) => setIcon(e.target.value.slice(0, 2))}
+          style={{ ...S.input, width: 52, textAlign: "center", marginBottom: 0 }} aria-label="Иконка" />
+        <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Что сделали" autoFocus
+          style={{ ...S.input, flex: 1, marginBottom: 0 }} />
+        <input type="number" min="1" max="9" value={points} onChange={(e) => setPoints(e.target.value)}
+          style={{ ...S.input, width: 56, marginBottom: 0 }} aria-label="Очки" />
       </div>
       <label style={S.check}>
-        <input
-          type="checkbox"
-          checked={keep}
-          onChange={(e) => setKeep(e.target.checked)}
-        />
+        <input type="checkbox" checked={keep} onChange={(e) => setKeep(e.target.checked)} />
         Оставить в списке дел
       </label>
       <div style={S.who}>
         {state.players.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => log(p.id)}
-            disabled={!title.trim()}
-            style={{
-              ...S.whoBtn,
-              background: p.color,
-              opacity: title.trim() ? 1 : 0.4,
-            }}
-          >
+          <button key={p.id} onClick={() => log(p.id)} disabled={!title.trim()}
+            style={{ ...S.whoBtn, background: p.color, opacity: title.trim() ? 1 : 0.4 }}>
             {p.name}
           </button>
         ))}
-        <button onClick={() => setOn(false)} style={S.cancel}>
-          Отмена
-        </button>
+        <button onClick={() => setOn(false)} style={S.cancel}>Отмена</button>
       </div>
     </div>
   );
 }
 
+/* ---------- settings ---------- */
+
 function Settings({ state, sync }) {
+  const [dump, setDump] = useState("");
+  const [paste, setPaste] = useState("");
+  const [msg, setMsg] = useState("");
+  const [armed, setArmed] = useState(false);
   const upd = (patch) => sync({ ...state, ...patch, settingsAt: Date.now() });
   const setChore = (i, patch) =>
     upd({ chores: state.chores.map((x, j) => (j === i ? { ...x, ...patch } : x)) });
+
+  function restore() {
+    const t = paste.trim();
+    if (!t) return setMsg("Вставьте текст резервной копии в поле выше.");
+    try {
+      const d = JSON.parse(t);
+      if (!d.players || !d.log) throw new Error();
+      sync({ ...INITIAL, ...d, settingsAt: Date.now() });
+      setPaste("");
+      setMsg("Восстановлено.");
+    } catch {
+      setMsg("Не похоже на резервную копию. Проверьте, что скопирован весь текст.");
+    }
+  }
 
   return (
     <div style={{ display: "grid", gap: 22 }}>
       <div>
         <h3 style={S.h3}>Кто играет</h3>
         {state.players.map((p, i) => (
-          <input
-            key={p.id}
-            value={p.name}
-            onChange={(e) =>
-              upd({
-                players: state.players.map((x, j) =>
-                  j === i ? { ...x, name: e.target.value } : x
-                ),
-              })
-            }
-            style={{ ...S.input, borderColor: p.color }}
-          />
+          <input key={p.id} value={p.name}
+            onChange={(e) => upd({ players: state.players.map((x, j) => (j === i ? { ...x, name: e.target.value } : x)) })}
+            style={{ ...S.input, borderColor: p.color }} />
         ))}
       </div>
 
       <div>
         <h3 style={S.h3}>Приз победителю недели</h3>
-        <input
-          value={state.prize}
-          onChange={(e) => upd({ prize: e.target.value })}
-          style={S.input}
-        />
+        <input value={state.prize} onChange={(e) => upd({ prize: e.target.value })} style={S.input} />
       </div>
 
       <div>
         <h3 style={S.h3}>Дела и вес</h3>
-        <p style={S.hint}>
-          Ставьте веса вдвоём. Дело, которое бесит сильнее, стоит дороже.
-        </p>
+        <p style={S.hint}>Ставьте веса вдвоём. Дело, которое бесит сильнее, стоит дороже.</p>
         {state.chores.map((c, i) => (
           <div key={c.id} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-            <input
-              value={c.icon || ""}
-              onChange={(e) => setChore(i, { icon: e.target.value.slice(0, 2) })}
-              style={{ ...S.input, width: 52, textAlign: "center", marginBottom: 0 }}
-              aria-label="Иконка"
-            />
-            <input
-              value={c.title}
-              onChange={(e) => setChore(i, { title: e.target.value })}
-              style={{ ...S.input, flex: 1, marginBottom: 0 }}
-            />
-            <input
-              type="number"
-              min="1"
-              max="9"
-              value={c.points}
-              onChange={(e) =>
-                setChore(i, { points: Number(e.target.value) || 1 })
-              }
-              style={{ ...S.input, width: 56, marginBottom: 0 }}
-              aria-label="Очки"
-            />
-            <button
-              onClick={() => upd({ chores: state.chores.filter((x) => x.id !== c.id) })}
-              style={S.del}
-              aria-label="Удалить дело"
-            >
-              ✕
-            </button>
+            <input value={c.icon || ""} onChange={(e) => setChore(i, { icon: e.target.value.slice(0, 2) })}
+              style={{ ...S.input, width: 52, textAlign: "center", marginBottom: 0 }} aria-label="Иконка" />
+            <input value={c.title} onChange={(e) => setChore(i, { title: e.target.value })}
+              style={{ ...S.input, flex: 1, marginBottom: 0 }} />
+            <input type="number" min="1" max="9" value={c.points}
+              onChange={(e) => setChore(i, { points: Number(e.target.value) || 1 })}
+              style={{ ...S.input, width: 56, marginBottom: 0 }} aria-label="Очки" />
+            <button onClick={() => upd({ chores: state.chores.filter((x) => x.id !== c.id) })}
+              style={S.del} aria-label="Удалить дело">✕</button>
           </div>
         ))}
-        <button
-          onClick={() =>
-            upd({
-              chores: [
-                ...state.chores,
-                { id: `c${Date.now()}`, icon: "✳️", title: "Новое дело", points: 1 },
-              ],
-            })
-          }
-          style={S.add}
-        >
-          Добавить дело
-        </button>
+        <button onClick={() => upd({ chores: [...state.chores, { id: `c${Date.now()}`, icon: "✳️", title: "Новое дело", points: 1 }] })}
+          style={S.add}>Добавить дело</button>
       </div>
 
       <div>
@@ -670,15 +912,41 @@ function Settings({ state, sync }) {
         </p>
       </div>
 
-      <button
-        onClick={() => {
-          if (confirm("Стереть весь счёт и историю?"))
+      <div>
+        <h3 style={S.h3}>Резервная копия</h3>
+        <p style={S.hint}>
+          Данные лежат в одном bin на jsonbin.io. Раз в пару недель копируйте текст
+          ниже себе в заметки — если bin потеряется, вставьте копию во второе поле
+          и нажмите «Восстановить».
+        </p>
+        <textarea readOnly value={dump} placeholder="Нажмите «Показать данные»"
+          style={{ ...S.input, height: 90, fontSize: 12, resize: "vertical" }} />
+        <button onClick={() => setDump(JSON.stringify(state))} style={{ ...S.add, marginBottom: 12 }}>
+          Показать данные
+        </button>
+        <textarea value={paste} onChange={(e) => { setPaste(e.target.value); setMsg(""); }}
+          placeholder="Вставьте сюда резервную копию"
+          style={{ ...S.input, height: 70, fontSize: 12, resize: "vertical" }} />
+        <button onClick={restore} style={S.add}>Восстановить</button>
+        {msg && <p style={{ ...S.hint, margin: "10px 0 0" }}>{msg}</p>}
+      </div>
+
+      <div>
+        <button
+          onClick={() => {
+            if (!armed) {
+              setArmed(true);
+              setTimeout(() => setArmed(false), 4000);
+              return;
+            }
+            setArmed(false);
             sync({ ...INITIAL, settingsAt: Date.now() });
-        }}
-        style={S.reset}
-      >
-        Начать всё заново
-      </button>
+          }}
+          style={{ ...S.reset, width: "100%" }}
+        >
+          {armed ? "Точно стереть? Нажмите ещё раз" : "Начать всё заново"}
+        </button>
+      </div>
     </div>
   );
 }
@@ -688,199 +956,61 @@ function Settings({ state, sync }) {
 const S = {
   root: {
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-    background: C.bg,
-    color: C.text,
-    minHeight: "100%",
-    padding: "18px 18px 40px",
-    maxWidth: 480,
-    margin: "0 auto",
+    background: C.bg, color: C.text, minHeight: "100%",
+    padding: `calc(${CONFIG.TOP_PAD}px + env(safe-area-inset-top, 0px)) 18px 40px`,
+    maxWidth: 480, margin: "0 auto",
   },
   head: { marginBottom: 18 },
   week: { fontSize: 13, color: C.dim, letterSpacing: 0.2 },
   board: { display: "flex", alignItems: "flex-start", gap: 10 },
   vs: { fontSize: 34, color: C.line, fontWeight: 300, paddingTop: 14 },
-  score: {
-    fontSize: 68,
-    fontWeight: 700,
-    lineHeight: 1,
-    fontVariantNumeric: "tabular-nums",
-  },
+  score: { fontSize: 68, fontWeight: 700, lineHeight: 1, fontVariantNumeric: "tabular-nums" },
   name: { fontSize: 15, color: C.text, marginTop: 6 },
-  meta: {
-    fontSize: 12,
-    color: C.dim,
-    marginTop: 4,
-    display: "flex",
-    gap: 8,
-    justifyContent: "inherit",
-  },
+  meta: { fontSize: 12, color: C.dim, marginTop: 4, display: "flex", gap: 8, justifyContent: "inherit" },
   popup: { position: "absolute", top: -8, left: "45%", fontSize: 24, fontWeight: 700 },
-  barWrap: {
-    display: "flex",
-    height: 6,
-    borderRadius: 3,
-    overflow: "hidden",
-    marginTop: 18,
-    background: C.line,
-  },
+  barWrap: { display: "flex", height: 6, borderRadius: 3, overflow: "hidden", marginTop: 18, background: C.line },
   bar: { transition: "width .35s ease" },
   prize: { fontSize: 13, color: C.dim, marginTop: 12, lineHeight: 1.5, minHeight: 20 },
-  toast: {
-    fontSize: 14,
-    color: C.text,
-    marginTop: 12,
-    lineHeight: 1.5,
-    minHeight: 20,
-    fontWeight: 600,
-  },
-  tabs: { display: "flex", gap: 20, marginTop: 22, borderBottom: `1px solid ${C.line}` },
-  tab: {
-    background: "none",
-    border: "none",
-    borderBottom: "2px solid transparent",
-    padding: "8px 0",
-    fontSize: 15,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  },
+  toast: { fontSize: 14, color: C.text, marginTop: 12, lineHeight: 1.5, minHeight: 20, fontWeight: 600 },
+  tabs: { display: "flex", gap: 16, marginTop: 22, borderBottom: `1px solid ${C.line}` },
+  tab: { background: "none", border: "none", borderBottom: "2px solid transparent", padding: "8px 0", fontSize: 15, cursor: "pointer", fontFamily: "inherit" },
   main: { marginTop: 18 },
   list: { listStyle: "none", padding: 0, margin: 0 },
   row: { marginBottom: 8 },
   choreBtn: {
-    width: "100%",
-    display: "flex",
-    alignItems: "center",
-    gap: 12,
-    background: C.surface,
-    border: "none",
-    borderRadius: 12,
-    color: C.text,
-    padding: "14px 16px",
-    fontSize: 15,
-    textAlign: "left",
-    cursor: "pointer",
-    fontFamily: "inherit",
+    width: "100%", display: "flex", alignItems: "center", gap: 12,
+    background: C.surface, border: "none", borderRadius: 12, color: C.text,
+    padding: "14px 16px", fontSize: 15, textAlign: "left", cursor: "pointer", fontFamily: "inherit",
   },
   icon: { fontSize: 20, width: 24, textAlign: "center", flexShrink: 0 },
   pts: { color: C.dim, fontSize: 14, fontVariantNumeric: "tabular-nums", flexShrink: 0 },
   who: { display: "flex", gap: 8, marginTop: 6 },
-  whoBtn: {
-    flex: 1,
-    border: "none",
-    borderRadius: 10,
-    padding: "13px 0",
-    color: C.bg,
-    fontSize: 15,
-    fontWeight: 600,
-    cursor: "pointer",
-    fontFamily: "inherit",
+  whoBtn: { flex: 1, border: "none", borderRadius: 10, padding: "13px 0", color: C.bg, fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" },
+  back: { background: "none", border: "none", color: C.dim, fontSize: 14, padding: 0, cursor: "pointer", fontFamily: "inherit", textAlign: "left" },
+  turnLine: { fontSize: 15, marginBottom: 12, fontWeight: 600 },
+  grid: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 },
+  cell: {
+    aspectRatio: "1", background: C.surface, border: "none", borderRadius: 12,
+    fontSize: 34, cursor: "pointer", fontFamily: "inherit", display: "grid", placeItems: "center",
   },
-  quick: {
-    width: "100%",
-    marginTop: 4,
-    background: "none",
-    border: `1px dashed ${C.line}`,
-    borderRadius: 12,
-    color: C.dim,
-    padding: "14px 0",
-    fontSize: 15,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  },
-  quickBox: {
-    marginTop: 4,
-    padding: 12,
-    background: C.surface,
-    borderRadius: 12,
-    display: "grid",
-    gap: 10,
-  },
-  check: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    fontSize: 13,
-    color: C.dim,
-    cursor: "pointer",
-  },
-  cancel: {
-    background: "none",
-    border: `1px solid ${C.line}`,
-    borderRadius: 10,
-    color: C.dim,
-    padding: "0 14px",
-    fontSize: 14,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  },
-  feedRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    padding: "12px 0",
-    borderBottom: `1px solid ${C.line}`,
-    fontSize: 15,
-  },
-  dot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-    display: "inline-block",
-    marginRight: 6,
-  },
+  quick: { width: "100%", marginTop: 4, background: "none", border: `1px dashed ${C.line}`, borderRadius: 12, color: C.dim, padding: "14px 0", fontSize: 15, cursor: "pointer", fontFamily: "inherit" },
+  quickBox: { marginTop: 4, padding: 12, background: C.surface, borderRadius: 12, display: "grid", gap: 10 },
+  check: { display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: C.dim, cursor: "pointer" },
+  cancel: { background: "none", border: `1px solid ${C.line}`, borderRadius: 10, color: C.dim, padding: "0 14px", fontSize: 14, cursor: "pointer", fontFamily: "inherit" },
+  cancelWide: { background: "none", border: `1px solid ${C.line}`, borderRadius: 10, color: C.dim, padding: "13px 0", fontSize: 15, cursor: "pointer", fontFamily: "inherit", width: "100%" },
+  feedRow: { display: "flex", alignItems: "center", gap: 10, padding: "12px 0", borderBottom: `1px solid ${C.line}`, fontSize: 15 },
+  achRow: { display: "flex", alignItems: "center", gap: 12, padding: "12px 0", borderBottom: `1px solid ${C.line}`, fontSize: 15 },
+  dot: { width: 7, height: 7, borderRadius: 4, display: "inline-block", marginRight: 6 },
   feedMeta: { display: "block", fontSize: 12, color: C.dim, marginTop: 3 },
-  undo: {
-    background: "none",
-    border: "none",
-    color: C.line,
-    cursor: "pointer",
-    fontSize: 15,
-    padding: 4,
-  },
+  undo: { background: "none", border: "none", color: C.line, cursor: "pointer", fontSize: 15, padding: 4 },
   empty: { color: C.dim, fontSize: 15, lineHeight: 1.6, marginTop: 8 },
   note: { color: C.dim, fontSize: 13, marginBottom: 14 },
   h3: { fontSize: 15, fontWeight: 600, margin: "0 0 10px" },
   hint: { fontSize: 13, color: C.dim, margin: "-4px 0 12px", lineHeight: 1.5 },
-  input: {
-    width: "100%",
-    background: C.surfaceHi,
-    border: `1px solid ${C.line}`,
-    borderRadius: 10,
-    color: C.text,
-    padding: "12px 14px",
-    fontSize: 15,
-    marginBottom: 8,
-    fontFamily: "inherit",
-  },
-  del: {
-    background: "none",
-    border: `1px solid ${C.line}`,
-    borderRadius: 10,
-    color: C.dim,
-    width: 44,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  },
-  add: {
-    background: C.surfaceHi,
-    border: "none",
-    borderRadius: 10,
-    color: C.text,
-    padding: "12px 16px",
-    fontSize: 15,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  },
-  reset: {
-    background: "none",
-    border: `1px solid ${C.danger}`,
-    borderRadius: 10,
-    color: C.danger,
-    padding: "12px 16px",
-    fontSize: 14,
-    cursor: "pointer",
-    fontFamily: "inherit",
-  },
+  input: { width: "100%", background: C.surfaceHi, border: `1px solid ${C.line}`, borderRadius: 10, color: C.text, padding: "12px 14px", fontSize: 15, marginBottom: 8, fontFamily: "inherit" },
+  del: { background: "none", border: `1px solid ${C.line}`, borderRadius: 10, color: C.dim, width: 44, cursor: "pointer", fontFamily: "inherit" },
+  add: { background: C.surfaceHi, border: "none", borderRadius: 10, color: C.text, padding: "12px 16px", fontSize: 15, cursor: "pointer", fontFamily: "inherit" },
+  reset: { background: "none", border: `1px solid ${C.danger}`, borderRadius: 10, color: C.danger, padding: "12px 16px", fontSize: 14, cursor: "pointer", fontFamily: "inherit" },
 };
 
 /* ---------- boot ---------- */
