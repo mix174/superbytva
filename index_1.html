@@ -1,0 +1,901 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Домашний счёт</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏆</text></svg>">
+<style>html,body{margin:0;background:#191A2E;}</style>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.29.8/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  // ==== НАСТРОЙКИ ====
+  window.CONFIG = {
+    BIN_ID: "6aaac11affd5d160530ecd5e",          // ID bin на jsonbin.io
+    ACCESS_KEY: "$2a$10$4jLGHSq6t9XFTXvyaO9mwePMiuZcL5ySXe9uyOuUjuFMdy2gip9fO",  // Access Key (не Master Key!) с правами Bins: Read + Update
+    POLL_MS: 30000,                  // как часто подтягивать изменения второго игрока
+  };
+</script>
+<script type="text/babel" data-presets="react">
+const CONFIG = window.CONFIG;
+const { useState, useEffect, useRef, useCallback } = React;
+
+const KEY = "home_score_v2";
+
+const C = {
+  bg: "#191A2E",
+  surface: "#232544",
+  surfaceHi: "#2C2F52",
+  line: "#3A3D63",
+  text: "#EDEBF5",
+  dim: "#9895B8",
+  a: "#F2B544",
+  b: "#4FC3B0",
+  danger: "#E2725B",
+};
+
+const DEFAULT_CHORES = [
+  { id: "c1", icon: "🗑", title: "Вынести мусор", points: 1 },
+  { id: "c2", icon: "🍽", title: "Посудомойка: загрузить и разобрать", points: 1 },
+  { id: "c3", icon: "🍳", title: "Приготовить ужин", points: 3 },
+  { id: "c4", icon: "🧽", title: "Убрать кухню после готовки", points: 2 },
+  { id: "c5", icon: "🧹", title: "Пропылесосить", points: 2 },
+  { id: "c6", icon: "🧺", title: "Стирка и развесить", points: 2 },
+  { id: "c7", icon: "🪣", title: "Помыть полы", points: 2 },
+  { id: "c8", icon: "🚿", title: "Отмыть ванную", points: 4 },
+  { id: "c9", icon: "🛒", title: "Съездить за продуктами", points: 3 },
+  { id: "c10", icon: "🛏", title: "Сменить постельное", points: 2 },
+  { id: "c11", icon: "📄", title: "Разобраться с бытовой бумажкой", points: 2 },
+];
+
+const INITIAL = {
+  players: [
+    { id: "p1", name: "Аня", color: C.a },
+    { id: "p2", name: "Макс", color: C.b },
+  ],
+  chores: DEFAULT_CHORES,
+  log: [],
+  prize: "Победитель выбирает, что смотрим в пятницу",
+  settingsAt: 0,
+};
+
+const TITLES = [
+  [35, "Легенда быта"],
+  [22, "Мастер швабры"],
+  [12, "Боец рутины"],
+  [5, "Подмастерье"],
+  [1, "Новичок"],
+];
+const titleFor = (n) => (TITLES.find(([m]) => n >= m) || [0, "Наблюдатель"])[1];
+
+/* ---------- storage (JSONBin + localStorage cache) ---------- */
+
+const BIN_URL = `https://api.jsonbin.io/v3/b/${CONFIG.BIN_ID}`;
+const HEADERS = { "Content-Type": "application/json", "X-Access-Key": CONFIG.ACCESS_KEY };
+
+function readCache() {
+  try {
+    const v = localStorage.getItem(KEY);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
+}
+function writeCache(v) {
+  try {
+    localStorage.setItem(KEY, JSON.stringify(v));
+  } catch {}
+}
+
+async function loadRaw() {
+  try {
+    const res = await fetch(`${BIN_URL}/latest`, {
+      headers: { ...HEADERS, "X-Bin-Meta": "false" },
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    if (!data || !Object.keys(data).length) return readCache();
+    writeCache(data);
+    return data;
+  } catch {
+    return readCache();
+  }
+}
+
+async function saveMerged(local) {
+  const remote = await loadRaw();
+  let merged = local;
+  if (remote) {
+    const seen = new Set();
+    const dropped = new Set([
+      ...(remote.removed || []),
+      ...(local.removed || []),
+    ]);
+    const log = [...(remote.log || []), ...(local.log || [])]
+      .filter((e) => (seen.has(e.id) ? false : seen.add(e.id)))
+      .filter((e) => !dropped.has(e.id));
+    const newer =
+      (remote.settingsAt || 0) > (local.settingsAt || 0) ? remote : local;
+    merged = { ...newer, log, removed: [...dropped].slice(-300) };
+  }
+  writeCache(merged);
+  try {
+    await fetch(BIN_URL, {
+      method: "PUT",
+      headers: HEADERS,
+      body: JSON.stringify(merged),
+    });
+  } catch {
+    /* оставляем локальную версию до следующего сохранения */
+  }
+  return merged;
+}
+
+/* ---------- dates & stats ---------- */
+
+function weekStart(d = new Date()) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+}
+const fmt = (d) =>
+  d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+const dayKey = (ts) => new Date(ts).toDateString();
+
+function relTime(ts) {
+  const m = Math.round((Date.now() - ts) / 60000);
+  if (m < 1) return "только что";
+  if (m < 60) return `${m} мин назад`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} ч назад`;
+  return new Date(ts).toLocaleDateString("ru-RU", {
+    day: "numeric",
+    month: "short",
+  });
+}
+
+const sum = (list, pid) =>
+  list.filter((e) => e.playerId === pid).reduce((s, e) => s + e.points, 0);
+
+function trophies(log, players) {
+  const cur = weekStart().getTime();
+  const weeks = {};
+  log.forEach((e) => {
+    const w = weekStart(new Date(e.ts)).getTime();
+    if (w >= cur) return;
+    (weeks[w] = weeks[w] || []).push(e);
+  });
+  const out = {};
+  players.forEach((p) => (out[p.id] = 0));
+  Object.values(weeks).forEach((list) => {
+    const scores = players.map((p) => [p.id, sum(list, p.id)]);
+    const best = Math.max(...scores.map((s) => s[1]));
+    const winners = scores.filter((s) => s[1] === best);
+    if (best > 0 && winners.length === 1) out[winners[0][0]] += 1;
+  });
+  return out;
+}
+
+function streak(log, pid) {
+  const days = new Set(
+    log.filter((e) => e.playerId === pid).map((e) => dayKey(e.ts))
+  );
+  if (!days.size) return 0;
+  const d = new Date();
+  d.setHours(12, 0, 0, 0);
+  if (!days.has(d.toDateString())) d.setDate(d.getDate() - 1);
+  let n = 0;
+  while (days.has(d.toDateString())) {
+    n += 1;
+    d.setDate(d.getDate() - 1);
+  }
+  return n;
+}
+
+/* ---------- app ---------- */
+
+function App() {
+  const [state, setState] = useState(INITIAL);
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState("chores");
+  const [open, setOpen] = useState(null);
+  const [pop, setPop] = useState(null);
+  const [toast, setToast] = useState("");
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  useEffect(() => {
+    (async () => {
+      const r = await loadRaw();
+      if (r) setState({ ...INITIAL, ...r });
+      setReady(true);
+    })();
+  }, []);
+
+  const sync = useCallback(async (next) => {
+    setState(next);
+    const merged = await saveMerged(next);
+    setState((cur) => (cur === next ? merged : cur));
+  }, []);
+
+  useEffect(() => {
+    const pull = async () => {
+      if (document.hidden) return;
+      const r = await loadRaw();
+      if (r) setState((cur) => ({ ...cur, ...r }));
+    };
+    const t = setInterval(pull, CONFIG.POLL_MS);
+    document.addEventListener("visibilitychange", pull);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", pull);
+    };
+  }, []);
+
+  const ws = weekStart();
+  const log = state.log || [];
+  const weekLog = log.filter((e) => e.ts >= ws.getTime());
+  const [A, B] = state.players;
+  const sa = sum(weekLog, A.id);
+  const sb = sum(weekLog, B.id);
+  const total = sa + sb;
+  const cups = trophies(log, state.players);
+
+  const prevStart = new Date(ws);
+  prevStart.setDate(prevStart.getDate() - 7);
+  const prevLog = log.filter(
+    (e) => e.ts >= prevStart.getTime() && e.ts < ws.getTime()
+  );
+
+  function addEntry(chore, playerId) {
+    const entry = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      choreId: chore.id || "custom",
+      icon: chore.icon || "✳️",
+      title: chore.title,
+      points: chore.points,
+      playerId,
+      ts: Date.now(),
+    };
+    const next = { ...stateRef.current, log: [...stateRef.current.log, entry] };
+    sync(next);
+    setOpen(null);
+
+    const p = stateRef.current.players.find((x) => x.id === playerId);
+    const st = streak(next.log, playerId);
+    const before = sum(
+      weekLog.filter((e) => e.playerId === playerId),
+      playerId
+    );
+    const after = before + chore.points;
+    const jumped = titleFor(after) !== titleFor(before);
+    setPop({ playerId, points: chore.points, k: entry.id });
+    setToast(
+      jumped
+        ? `${p.name} теперь ${titleFor(after).toLowerCase()}`
+        : st >= 3
+        ? `${st}-й день подряд, ${p.name}`
+        : ""
+    );
+    setTimeout(() => setPop((x) => (x && x.k === entry.id ? null : x)), 1100);
+    setTimeout(() => setToast(""), 2600);
+  }
+
+  function removeEntry(id) {
+    const s = stateRef.current;
+    sync({
+      ...s,
+      log: s.log.filter((e) => e.id !== id),
+      removed: [...(s.removed || []), id],
+    });
+  }
+
+  if (!ready)
+    return (
+      <div style={{ ...S.root, display: "grid", placeItems: "center" }}>
+        <span style={{ color: C.dim }}>Загружаем счёт…</span>
+      </div>
+    );
+
+  return (
+    <div style={S.root}>
+      <style>{`
+        * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+        button:focus-visible { outline: 2px solid ${C.text}; outline-offset: 2px; }
+        input:focus { outline: none; border-color: ${C.dim}; }
+        @keyframes rise { 0%{opacity:0;transform:translateY(8px) scale(.85)} 25%{opacity:1;transform:translateY(-4px) scale(1.05)} 100%{opacity:0;transform:translateY(-30px) scale(1)} }
+        @keyframes slide { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:none} }
+        .pop { animation: rise 1.1s ease-out forwards; }
+        .toast { animation: slide .25s ease-out; }
+        @media (prefers-reduced-motion: reduce) { .pop{animation:none;opacity:0} .toast{animation:none} }
+      `}</style>
+
+      <header style={S.head}>
+        <span style={S.week}>
+          Неделя {fmt(ws)} — {fmt(new Date(ws.getTime() + 6 * 864e5))}
+        </span>
+      </header>
+
+      <section style={S.board}>
+        <Side p={A} score={sa} cups={cups[A.id]} st={streak(log, A.id)} pop={pop} align="left" />
+        <div style={S.vs}>:</div>
+        <Side p={B} score={sb} cups={cups[B.id]} st={streak(log, B.id)} pop={pop} align="right" />
+      </section>
+
+      <div style={S.barWrap}>
+        <div
+          style={{
+            ...S.bar,
+            width: total ? `${(sa / total) * 100}%` : "50%",
+            background: A.color,
+          }}
+        />
+        <div style={{ ...S.bar, flex: 1, background: total ? B.color : C.line }} />
+      </div>
+
+      {toast ? (
+        <p className="toast" style={S.toast}>
+          {toast}
+        </p>
+      ) : (
+        <p style={S.prize}>
+          {total === 0
+            ? "Счёт 0:0. Кто-то же должен начать."
+            : sa === sb
+            ? "Ничья. Подозрительно ровно."
+            : `Ведёт ${sa > sb ? A.name : B.name} — ${titleFor(
+                Math.max(sa, sb)
+              ).toLowerCase()}, разрыв ${Math.abs(sa - sb)}.`}
+          {state.prize ? ` Приз: ${state.prize.toLowerCase()}.` : ""}
+        </p>
+      )}
+
+      <nav style={S.tabs}>
+        {[
+          ["chores", "Дела"],
+          ["feed", "Лента"],
+          ["set", "Настройки"],
+        ].map(([k, label]) => (
+          <button
+            key={k}
+            onClick={() => setTab(k)}
+            style={{
+              ...S.tab,
+              color: tab === k ? C.text : C.dim,
+              borderBottomColor: tab === k ? C.text : "transparent",
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      <main style={S.main}>
+        {tab === "chores" && (
+          <>
+            <ul style={S.list}>
+              {state.chores.map((c) => (
+                <li key={c.id} style={S.row}>
+                  <button
+                    onClick={() => setOpen(open === c.id ? null : c.id)}
+                    style={S.choreBtn}
+                    aria-expanded={open === c.id}
+                  >
+                    <span style={S.icon}>{c.icon || "✳️"}</span>
+                    <span style={{ flex: 1 }}>{c.title}</span>
+                    <span style={S.pts}>{c.points}</span>
+                  </button>
+                  {open === c.id && (
+                    <div style={S.who}>
+                      {state.players.map((p) => (
+                        <button
+                          key={p.id}
+                          onClick={() => addEntry(c, p.id)}
+                          style={{ ...S.whoBtn, background: p.color }}
+                        >
+                          {p.name}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <QuickAdd state={state} sync={sync} addEntry={addEntry} />
+          </>
+        )}
+
+        {tab === "feed" && (
+          <div>
+            {prevLog.length > 0 && (
+              <p style={S.note}>
+                Прошлая неделя: {sum(prevLog, A.id)} — {sum(prevLog, B.id)}
+              </p>
+            )}
+            {weekLog.length === 0 ? (
+              <p style={S.empty}>
+                На этой неделе пусто. Посуда сама себя не помоет — откройте
+                «Дела».
+              </p>
+            ) : (
+              <ul style={S.list}>
+                {[...weekLog]
+                  .sort((a, b) => b.ts - a.ts)
+                  .map((e) => {
+                    const p = state.players.find((x) => x.id === e.playerId);
+                    return (
+                      <li key={e.id} style={S.feedRow}>
+                        <span style={S.icon}>{e.icon || "✳️"}</span>
+                        <span style={{ flex: 1 }}>
+                          {e.title}
+                          <span style={S.feedMeta}>
+                            <span
+                              style={{
+                                ...S.dot,
+                                background: p ? p.color : C.dim,
+                              }}
+                            />
+                            {p ? p.name : "?"}, {relTime(e.ts)}
+                          </span>
+                        </span>
+                        <span style={S.pts}>+{e.points}</span>
+                        <button
+                          onClick={() => removeEntry(e.id)}
+                          style={S.undo}
+                          aria-label="Убрать запись"
+                        >
+                          ✕
+                        </button>
+                      </li>
+                    );
+                  })}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {tab === "set" && <Settings state={state} sync={sync} />}
+      </main>
+    </div>
+  );
+}
+
+function Side({ p, score, cups, st, pop, align }) {
+  return (
+    <div style={{ textAlign: align, position: "relative", flex: 1 }}>
+      {pop && pop.playerId === p.id && (
+        <span className="pop" style={{ ...S.popup, color: p.color }}>
+          +{pop.points}
+        </span>
+      )}
+      <div style={{ ...S.score, color: p.color }}>{score}</div>
+      <div style={S.name}>{p.name}</div>
+      <div style={S.meta}>
+        {cups > 0 && <span>🏆 {cups}</span>}
+        {st > 1 && <span>🔥 {st} дн</span>}
+        {cups === 0 && st < 2 && <span>{titleFor(score).toLowerCase()}</span>}
+      </div>
+    </div>
+  );
+}
+
+function QuickAdd({ state, sync, addEntry }) {
+  const [on, setOn] = useState(false);
+  const [title, setTitle] = useState("");
+  const [icon, setIcon] = useState("✳️");
+  const [points, setPoints] = useState(2);
+  const [keep, setKeep] = useState(false);
+
+  function log(playerId) {
+    const t = title.trim();
+    if (!t) return;
+    const chore = { id: `x${Date.now()}`, icon, title: t, points: Number(points) || 1 };
+    if (keep)
+      sync({
+        ...state,
+        chores: [...state.chores, chore],
+        settingsAt: Date.now(),
+      });
+    addEntry(chore, playerId);
+    setTitle("");
+    setIcon("✳️");
+    setPoints(2);
+    setKeep(false);
+    setOn(false);
+  }
+
+  if (!on)
+    return (
+      <button onClick={() => setOn(true)} style={S.quick}>
+        + Разовое дело
+      </button>
+    );
+
+  return (
+    <div style={S.quickBox}>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={icon}
+          onChange={(e) => setIcon(e.target.value.slice(0, 2))}
+          style={{ ...S.input, width: 52, textAlign: "center", marginBottom: 0 }}
+          aria-label="Иконка"
+        />
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Что сделали"
+          autoFocus
+          style={{ ...S.input, flex: 1, marginBottom: 0 }}
+        />
+        <input
+          type="number"
+          min="1"
+          max="9"
+          value={points}
+          onChange={(e) => setPoints(e.target.value)}
+          style={{ ...S.input, width: 56, marginBottom: 0 }}
+          aria-label="Очки"
+        />
+      </div>
+      <label style={S.check}>
+        <input
+          type="checkbox"
+          checked={keep}
+          onChange={(e) => setKeep(e.target.checked)}
+        />
+        Оставить в списке дел
+      </label>
+      <div style={S.who}>
+        {state.players.map((p) => (
+          <button
+            key={p.id}
+            onClick={() => log(p.id)}
+            disabled={!title.trim()}
+            style={{
+              ...S.whoBtn,
+              background: p.color,
+              opacity: title.trim() ? 1 : 0.4,
+            }}
+          >
+            {p.name}
+          </button>
+        ))}
+        <button onClick={() => setOn(false)} style={S.cancel}>
+          Отмена
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Settings({ state, sync }) {
+  const upd = (patch) => sync({ ...state, ...patch, settingsAt: Date.now() });
+  const setChore = (i, patch) =>
+    upd({ chores: state.chores.map((x, j) => (j === i ? { ...x, ...patch } : x)) });
+
+  return (
+    <div style={{ display: "grid", gap: 22 }}>
+      <div>
+        <h3 style={S.h3}>Кто играет</h3>
+        {state.players.map((p, i) => (
+          <input
+            key={p.id}
+            value={p.name}
+            onChange={(e) =>
+              upd({
+                players: state.players.map((x, j) =>
+                  j === i ? { ...x, name: e.target.value } : x
+                ),
+              })
+            }
+            style={{ ...S.input, borderColor: p.color }}
+          />
+        ))}
+      </div>
+
+      <div>
+        <h3 style={S.h3}>Приз победителю недели</h3>
+        <input
+          value={state.prize}
+          onChange={(e) => upd({ prize: e.target.value })}
+          style={S.input}
+        />
+      </div>
+
+      <div>
+        <h3 style={S.h3}>Дела и вес</h3>
+        <p style={S.hint}>
+          Ставьте веса вдвоём. Дело, которое бесит сильнее, стоит дороже.
+        </p>
+        {state.chores.map((c, i) => (
+          <div key={c.id} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input
+              value={c.icon || ""}
+              onChange={(e) => setChore(i, { icon: e.target.value.slice(0, 2) })}
+              style={{ ...S.input, width: 52, textAlign: "center", marginBottom: 0 }}
+              aria-label="Иконка"
+            />
+            <input
+              value={c.title}
+              onChange={(e) => setChore(i, { title: e.target.value })}
+              style={{ ...S.input, flex: 1, marginBottom: 0 }}
+            />
+            <input
+              type="number"
+              min="1"
+              max="9"
+              value={c.points}
+              onChange={(e) =>
+                setChore(i, { points: Number(e.target.value) || 1 })
+              }
+              style={{ ...S.input, width: 56, marginBottom: 0 }}
+              aria-label="Очки"
+            />
+            <button
+              onClick={() => upd({ chores: state.chores.filter((x) => x.id !== c.id) })}
+              style={S.del}
+              aria-label="Удалить дело"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+        <button
+          onClick={() =>
+            upd({
+              chores: [
+                ...state.chores,
+                { id: `c${Date.now()}`, icon: "✳️", title: "Новое дело", points: 1 },
+              ],
+            })
+          }
+          style={S.add}
+        >
+          Добавить дело
+        </button>
+      </div>
+
+      <div>
+        <h3 style={S.h3}>Титулы за неделю</h3>
+        <p style={S.hint}>
+          1 — новичок, 5 — подмастерье, 12 — боец рутины, 22 — мастер швабры,
+          35 — легенда быта. 🏆 — выигранные недели, 🔥 — дни подряд.
+        </p>
+      </div>
+
+      <button
+        onClick={() => {
+          if (confirm("Стереть весь счёт и историю?"))
+            sync({ ...INITIAL, settingsAt: Date.now() });
+        }}
+        style={S.reset}
+      >
+        Начать всё заново
+      </button>
+    </div>
+  );
+}
+
+/* ---------- styles ---------- */
+
+const S = {
+  root: {
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    background: C.bg,
+    color: C.text,
+    minHeight: "100%",
+    padding: "18px 18px 40px",
+    maxWidth: 480,
+    margin: "0 auto",
+  },
+  head: { marginBottom: 18 },
+  week: { fontSize: 13, color: C.dim, letterSpacing: 0.2 },
+  board: { display: "flex", alignItems: "flex-start", gap: 10 },
+  vs: { fontSize: 34, color: C.line, fontWeight: 300, paddingTop: 14 },
+  score: {
+    fontSize: 68,
+    fontWeight: 700,
+    lineHeight: 1,
+    fontVariantNumeric: "tabular-nums",
+  },
+  name: { fontSize: 15, color: C.text, marginTop: 6 },
+  meta: {
+    fontSize: 12,
+    color: C.dim,
+    marginTop: 4,
+    display: "flex",
+    gap: 8,
+    justifyContent: "inherit",
+  },
+  popup: { position: "absolute", top: -8, left: "45%", fontSize: 24, fontWeight: 700 },
+  barWrap: {
+    display: "flex",
+    height: 6,
+    borderRadius: 3,
+    overflow: "hidden",
+    marginTop: 18,
+    background: C.line,
+  },
+  bar: { transition: "width .35s ease" },
+  prize: { fontSize: 13, color: C.dim, marginTop: 12, lineHeight: 1.5, minHeight: 20 },
+  toast: {
+    fontSize: 14,
+    color: C.text,
+    marginTop: 12,
+    lineHeight: 1.5,
+    minHeight: 20,
+    fontWeight: 600,
+  },
+  tabs: { display: "flex", gap: 20, marginTop: 22, borderBottom: `1px solid ${C.line}` },
+  tab: {
+    background: "none",
+    border: "none",
+    borderBottom: "2px solid transparent",
+    padding: "8px 0",
+    fontSize: 15,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  main: { marginTop: 18 },
+  list: { listStyle: "none", padding: 0, margin: 0 },
+  row: { marginBottom: 8 },
+  choreBtn: {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    background: C.surface,
+    border: "none",
+    borderRadius: 12,
+    color: C.text,
+    padding: "14px 16px",
+    fontSize: 15,
+    textAlign: "left",
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  icon: { fontSize: 20, width: 24, textAlign: "center", flexShrink: 0 },
+  pts: { color: C.dim, fontSize: 14, fontVariantNumeric: "tabular-nums", flexShrink: 0 },
+  who: { display: "flex", gap: 8, marginTop: 6 },
+  whoBtn: {
+    flex: 1,
+    border: "none",
+    borderRadius: 10,
+    padding: "13px 0",
+    color: C.bg,
+    fontSize: 15,
+    fontWeight: 600,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  quick: {
+    width: "100%",
+    marginTop: 4,
+    background: "none",
+    border: `1px dashed ${C.line}`,
+    borderRadius: 12,
+    color: C.dim,
+    padding: "14px 0",
+    fontSize: 15,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  quickBox: {
+    marginTop: 4,
+    padding: 12,
+    background: C.surface,
+    borderRadius: 12,
+    display: "grid",
+    gap: 10,
+  },
+  check: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    fontSize: 13,
+    color: C.dim,
+    cursor: "pointer",
+  },
+  cancel: {
+    background: "none",
+    border: `1px solid ${C.line}`,
+    borderRadius: 10,
+    color: C.dim,
+    padding: "0 14px",
+    fontSize: 14,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  feedRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "12px 0",
+    borderBottom: `1px solid ${C.line}`,
+    fontSize: 15,
+  },
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    display: "inline-block",
+    marginRight: 6,
+  },
+  feedMeta: { display: "block", fontSize: 12, color: C.dim, marginTop: 3 },
+  undo: {
+    background: "none",
+    border: "none",
+    color: C.line,
+    cursor: "pointer",
+    fontSize: 15,
+    padding: 4,
+  },
+  empty: { color: C.dim, fontSize: 15, lineHeight: 1.6, marginTop: 8 },
+  note: { color: C.dim, fontSize: 13, marginBottom: 14 },
+  h3: { fontSize: 15, fontWeight: 600, margin: "0 0 10px" },
+  hint: { fontSize: 13, color: C.dim, margin: "-4px 0 12px", lineHeight: 1.5 },
+  input: {
+    width: "100%",
+    background: C.surfaceHi,
+    border: `1px solid ${C.line}`,
+    borderRadius: 10,
+    color: C.text,
+    padding: "12px 14px",
+    fontSize: 15,
+    marginBottom: 8,
+    fontFamily: "inherit",
+  },
+  del: {
+    background: "none",
+    border: `1px solid ${C.line}`,
+    borderRadius: 10,
+    color: C.dim,
+    width: 44,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  add: {
+    background: C.surfaceHi,
+    border: "none",
+    borderRadius: 10,
+    color: C.text,
+    padding: "12px 16px",
+    fontSize: 15,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  reset: {
+    background: "none",
+    border: `1px solid ${C.danger}`,
+    borderRadius: 10,
+    color: C.danger,
+    padding: "12px 16px",
+    fontSize: 14,
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+};
+
+/* ---------- boot ---------- */
+
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) {
+  tg.ready();
+  tg.expand();
+  try {
+    tg.setHeaderColor(C.bg);
+    tg.setBackgroundColor(C.bg);
+  } catch {}
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+</script>
+</body>
+</html>
